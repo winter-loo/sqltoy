@@ -25,9 +25,9 @@ fn main() {
             continue;
         }
 
-        match prepare_statement(line) {
+        match sqlite3_prepare(line) {
             Ok(stmt) => {
-                execute_statement(stmt);
+                sqlite3_step(stmt);
             }
             Err(errmsg) => {
                 println!("{errmsg}");
@@ -36,19 +36,37 @@ fn main() {
     }
 }
 
-fn prepare_statement(line: &str) -> Result<Statement, String> {
+fn sqlite3_prepare(line: &str) -> Result<Sqlite3Stmt, String> {
     let mut tokens = line.split_whitespace();
     match tokens.next() {
-        Some(token) => match token.to_lowercase().as_str() {
-            "select" => Ok(Statement::Select(SelectStatement {})),
-            "create" => Ok(Statement::Create(CreateTableStmt {})),
-            "insert" => Ok(Statement::Insert(InsertStatement {})),
-            "delete" => Ok(Statement::Delete(DeleteStatement {})),
-            "update" => Ok(Statement::Update(UpdateStatement {})),
-            _ => Err("unknown sql statement".to_string()),
+        Some(token) => {
+            let stmt = match token.to_lowercase().as_str() {
+                "select" => Statement::Select(SelectStatement {}),
+                "create" => Statement::Create(CreateTableStmt {}),
+                "insert" => Statement::Insert(InsertStatement {}),
+                "delete" => Statement::Delete(DeleteStatement {}),
+                "update" => Statement::Update(UpdateStatement {}),
+                _ => {
+                    return Err("unknown sql statement".to_string());
+                }
+            };
+            Ok(Sqlite3Stmt(Vdbe {stmt, table: Table::new()}))
         },
         None => unreachable!("empty line should already be filtered"),
     }
+}
+
+pub struct Sqlite3Stmt(Vdbe);
+
+/// Comment from sqlite3:
+///
+/// ```
+/// The "sqlite3_stmt" structure pointer that is returned by sqlite3_prepare()
+/// is really a pointer to an instance of this structure.
+/// ```
+struct Vdbe {
+    stmt: Statement,
+    table: Table,
 }
 
 enum Statement {
@@ -69,6 +87,29 @@ struct DeleteStatement {}
 
 struct UpdateStatement {}
 
-fn execute_statement(_stmt: Statement) {
-    println!("inserting...");
+fn sqlite3_step(stmt: Sqlite3Stmt) {
+    let vdbe = stmt.0;
+    match vdbe.stmt {
+        Statement::Select(_select_stmt) => {},
+        Statement::Insert(_insert_stmt) => {},
+        _ => {},
+    }
+}
+
+struct Row {
+    f1: u64,
+    f2: u64,
+    f3: u64,
+}
+
+struct Table {
+    rows: Vec<Row>,
+}
+
+impl Table {
+    fn new() -> Self {
+        Self {
+            rows: vec![],
+        }
+    }
 }
