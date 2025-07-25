@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Seek, Write},
+    io::{Read, Seek, Write}, rc::Rc,
 };
 
 fn main() {
@@ -151,32 +151,32 @@ impl Row {
     /// write String to disk using '<length><value>' format
     /// if '<length>' is zero, then no '<value>' is written!
     /// The '<length>' occupies 4 bytes.
-    fn serialize(&self, out: &mut File) {
+    fn serialize(&self, out: &mut [u8]) {
         match &self.f1 {
             Some(value) => {
-                let _ = out.write(&(value.len() as u32).to_be_bytes());
-                let _ = out.write(value.clone().as_bytes());
+                out.extend((value.len() as u32).to_be_bytes());
+                out.extend(value.clone().as_bytes());
             }
             None => {
-                let _ = out.write(&0u32.to_be_bytes());
+                out.extend(0u32.to_be_bytes());
             }
         }
         match &self.f2 {
             Some(value) => {
-                let _ = out.write(&(value.len() as u32).to_be_bytes());
-                let _ = out.write(value.clone().as_bytes());
+                out.extend((value.len() as u32).to_be_bytes());
+                out.extend(value.clone().as_bytes());
             }
             None => {
-                let _ = out.write(&0u32.to_be_bytes());
+                out.extend(0u32.to_be_bytes());
             }
         }
         match &self.f3 {
             Some(value) => {
-                let _ = out.write(&(value.len() as u32).to_be_bytes());
-                let _ = out.write(value.clone().as_bytes());
+                out.extend((value.len() as u32).to_be_bytes());
+                out.extend(value.clone().as_bytes());
             }
             None => {
-                let _ = out.write(&0u32.to_be_bytes());
+                out.extend(0u32.to_be_bytes());
             }
         }
     }
@@ -221,12 +221,75 @@ impl Row {
     }
 }
 
+const PAGE_SIZE: usize = 4096;
+
+struct Page {
+    data: [u8; PAGE_SIZE],
+    len: u32,
+}
+
+impl Page {
+    fn new() -> Self {
+        Self {
+            data: [0; 4096],
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> u32 {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn insert(&mut self, row: Row) {
+        row.serialize(&mut self.data);
+    }
+}
+
+struct Pager {
+    pages: Vec<Page>,
+    source: Option<File>,
+}
+
 struct Table {
-    rows: Vec<Row>,
-    pager: Option<File>,
+    num_pages: u64,
+    // table object uses pager object to fetch pages
+    pager: Pager,
 }
 
 impl Table {
+    fn new(path: String) -> Self {
+        Self {
+            num_pages: 0,
+            pager: Pager::new(path),
+        }
+    }
+
+    fn serialize(&mut self) -> std::io::Result<()> {
+        self.pager.serialize()
+    }
+
+    fn deserialize(&mut self) {
+        self.pager.deserialize();
+    }
+
+    fn insert(&mut self, row: Row) {
+        self.pager.insert(row);
+    }
+    
+    fn seq_scan(&self) -> TableIterator {
+        todo!("")
+    }
+}
+
+struct TableIterator {
+
+}
+
+impl Pager {
     fn new(path: String) -> Self {
         let file = if path == "::memory::" {
             None
@@ -242,9 +305,22 @@ impl Table {
             )
         };
         Self {
-            rows: vec![],
-            pager: file,
+            pages: vec![],
+            source: file,
         }
+    }
+
+    fn get(&self, page_no: u64) -> Page {
+        todo!("")
+    }
+
+    fn flush(&mut self) {
+        todo!("")
+    }
+
+    fn insert(&mut self, row: Row) {
+        // append-only
+        self.pages
     }
 
     fn serialize(&mut self) -> std::io::Result<()> {
