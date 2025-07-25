@@ -1,7 +1,16 @@
-use std::io::Write;
+use std::{
+    fs::{File, OpenOptions},
+    io::{Read, Seek, Write},
+};
 
 fn main() {
-    let mut table = Table::new();
+    let args = std::env::args().collect::<Vec<_>>();
+    let path = if args.len() == 2 {
+        args[1].clone()
+    } else {
+        "::memory::".to_string()
+    };
+    let mut table = Table::new(path);
 
     loop {
         print!("sqltoy> ");
@@ -50,17 +59,43 @@ fn sqlite3_prepare(line: &str) -> Result<Sqlite3Stmt, String> {
                         f1: tokens.next().map(|s| s.to_string()),
                         f2: tokens.next().map(|s| s.to_string()),
                         f3: tokens.next().map(|s| s.to_string()),
-                    }
+                    },
                 }),
                 "delete" => Statement::Delete(DeleteStatement {}),
                 "update" => Statement::Update(UpdateStatement {}),
+                "commit" => Statement::Commit,
                 _ => {
                     return Err("unknown sql statement".to_string());
                 }
             };
-            Ok(Sqlite3Stmt(Vdbe {stmt}))
-        },
+            Ok(Sqlite3Stmt(Vdbe { stmt }))
+        }
         None => unreachable!("empty line should already be filtered"),
+    }
+}
+
+fn sqlite3_step(stmt: Sqlite3Stmt, table: &mut Table) {
+    let vdbe = stmt.0;
+    match vdbe.stmt {
+        Statement::Select(_select_stmt) => {
+            if table.rows.is_empty() {
+                table.deserialize();
+            }
+            for row in &table.rows {
+                println!("{row:#?}");
+            }
+        }
+        Statement::Insert(insert_stmt) => {
+            table.rows.push(insert_stmt.row);
+        }
+        Statement::Commit => {
+            // persist table data into file
+            match table.serialize() {
+                Ok(_) => println!("commit OK"),
+                Err(err) => println!("{err:?}"),
+            }
+        }
+        _ => {}
     }
 }
 
@@ -82,6 +117,7 @@ enum Statement {
     Create(CreateTableStmt),
     Delete(DeleteStatement),
     Update(UpdateStatement),
+    Commit,
 }
 
 struct SelectStatement {}
@@ -96,21 +132,6 @@ struct DeleteStatement {}
 
 struct UpdateStatement {}
 
-fn sqlite3_step(stmt: Sqlite3Stmt, table: &mut Table) {
-    let vdbe = stmt.0;
-    match vdbe.stmt {
-        Statement::Select(_select_stmt) => {
-            for row in &table.rows {
-                println!("{row:#?}");
-            }
-        },
-        Statement::Insert(insert_stmt) => {
-            table.rows.push(insert_stmt.row);
-        },
-        _ => {},
-    }
-}
-
 #[derive(Debug)]
 struct Row {
     f1: Option<String>,
@@ -118,14 +139,134 @@ struct Row {
     f3: Option<String>,
 }
 
+impl Row {
+    fn new() -> Self {
+        Self {
+            f1: None,
+            f2: None,
+            f3: None,
+        }
+    }
+
+    /// write String to disk using '<length><value>' format
+    /// if '<length>' is zero, then no '<value>' is written!
+    /// The '<length>' occupies 4 bytes.
+    fn serialize(&self, out: &mut File) {
+        match &self.f1 {
+            Some(value) => {
+                let _ = out.write(&(value.len() as u32).to_be_bytes());
+                let _ = out.write(value.clone().as_bytes());
+            }
+            None => {
+                let _ = out.write(&0u32.to_be_bytes());
+            }
+        }
+        match &self.f2 {
+            Some(value) => {
+                let _ = out.write(&(value.len() as u32).to_be_bytes());
+                let _ = out.write(value.clone().as_bytes());
+            }
+            None => {
+                let _ = out.write(&0u32.to_be_bytes());
+            }
+        }
+        match &self.f3 {
+            Some(value) => {
+                let _ = out.write(&(value.len() as u32).to_be_bytes());
+                let _ = out.write(value.clone().as_bytes());
+            }
+            None => {
+                let _ = out.write(&0u32.to_be_bytes());
+            }
+        }
+    }
+
+    fn deserialize(input: &mut File) -> std::io::Result<Self> {
+        let mut row = Row::new();
+
+        let mut len_buf = [0u8; 4];
+        input.read_exact(&mut len_buf)?;
+        let len = u32::from_be_bytes(len_buf);
+        if len == 0 {
+            row.f1 = None;
+        } else {
+            let mut buf = vec![0u8; len as usize];
+            input.read_exact(&mut buf)?;
+            row.f1 = Some(String::from_utf8(buf).unwrap());
+        }
+
+        let mut len_buf = [0u8; 4];
+        input.read_exact(&mut len_buf)?;
+        let len = u32::from_be_bytes(len_buf);
+        if len == 0 {
+            row.f2 = None;
+        } else {
+            let mut buf = vec![0u8; len as usize];
+            input.read_exact(&mut buf)?;
+            row.f2 = Some(String::from_utf8(buf).unwrap());
+        }
+
+        let mut len_buf = [0u8; 4];
+        input.read_exact(&mut len_buf)?;
+        let len = u32::from_be_bytes(len_buf);
+        if len == 0 {
+            row.f3 = None;
+        } else {
+            let mut buf = vec![0u8; len as usize];
+            input.read_exact(&mut buf)?;
+            row.f3 = Some(String::from_utf8(buf).unwrap());
+        }
+
+        Ok(row)
+    }
+}
+
 struct Table {
     rows: Vec<Row>,
+    pager: Option<File>,
 }
 
 impl Table {
-    fn new() -> Self {
+    fn new(path: String) -> Self {
+        let file = if path == "::memory::" {
+            None
+        } else {
+            Some(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(path)
+                    .unwrap()
+            )
+        };
         Self {
             rows: vec![],
+            pager: file,
+        }
+    }
+
+    fn serialize(&mut self) -> std::io::Result<()> {
+        if self.pager.is_none() {
+            return Ok(());
+        }
+        let pager = self.pager.as_mut().unwrap();
+        // write from the beginning
+        pager.seek(std::io::SeekFrom::Start(0))?;
+        for row in &self.rows {
+            row.serialize(pager);
+        }
+        Ok(())
+    }
+
+    fn deserialize(&mut self) {
+        if self.pager.is_none() {
+            return;
+        }
+        let pager = self.pager.as_mut().unwrap();
+        while let Ok(row) = Row::deserialize(pager) {
+            self.rows.push(row);
         }
     }
 }
