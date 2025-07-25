@@ -1,6 +1,8 @@
 use std::io::Write;
 
 fn main() {
+    let mut table = Table::new();
+
     loop {
         print!("sqltoy> ");
         let _ = std::io::stdout().flush();
@@ -27,7 +29,7 @@ fn main() {
 
         match sqlite3_prepare(line) {
             Ok(stmt) => {
-                sqlite3_step(stmt);
+                sqlite3_step(stmt, &mut table);
             }
             Err(errmsg) => {
                 println!("{errmsg}");
@@ -43,14 +45,20 @@ fn sqlite3_prepare(line: &str) -> Result<Sqlite3Stmt, String> {
             let stmt = match token.to_lowercase().as_str() {
                 "select" => Statement::Select(SelectStatement {}),
                 "create" => Statement::Create(CreateTableStmt {}),
-                "insert" => Statement::Insert(InsertStatement {}),
+                "insert" => Statement::Insert(InsertStatement {
+                    row: Row {
+                        f1: tokens.next().map(|s| s.to_string()),
+                        f2: tokens.next().map(|s| s.to_string()),
+                        f3: tokens.next().map(|s| s.to_string()),
+                    }
+                }),
                 "delete" => Statement::Delete(DeleteStatement {}),
                 "update" => Statement::Update(UpdateStatement {}),
                 _ => {
                     return Err("unknown sql statement".to_string());
                 }
             };
-            Ok(Sqlite3Stmt(Vdbe {stmt, table: Table::new()}))
+            Ok(Sqlite3Stmt(Vdbe {stmt}))
         },
         None => unreachable!("empty line should already be filtered"),
     }
@@ -66,7 +74,6 @@ pub struct Sqlite3Stmt(Vdbe);
 /// ```
 struct Vdbe {
     stmt: Statement,
-    table: Table,
 }
 
 enum Statement {
@@ -79,7 +86,9 @@ enum Statement {
 
 struct SelectStatement {}
 
-struct InsertStatement {}
+struct InsertStatement {
+    row: Row,
+}
 
 struct CreateTableStmt {}
 
@@ -87,19 +96,26 @@ struct DeleteStatement {}
 
 struct UpdateStatement {}
 
-fn sqlite3_step(stmt: Sqlite3Stmt) {
+fn sqlite3_step(stmt: Sqlite3Stmt, table: &mut Table) {
     let vdbe = stmt.0;
     match vdbe.stmt {
-        Statement::Select(_select_stmt) => {},
-        Statement::Insert(_insert_stmt) => {},
+        Statement::Select(_select_stmt) => {
+            for row in &table.rows {
+                println!("{row:#?}");
+            }
+        },
+        Statement::Insert(insert_stmt) => {
+            table.rows.push(insert_stmt.row);
+        },
         _ => {},
     }
 }
 
+#[derive(Debug)]
 struct Row {
-    f1: u64,
-    f2: u64,
-    f3: u64,
+    f1: Option<String>,
+    f2: Option<String>,
+    f3: Option<String>,
 }
 
 struct Table {
