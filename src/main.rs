@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Seek, Write}, rc::Rc,
+    io::{Read, Seek, SeekFrom, Write},
 };
 
 fn main() {
@@ -8,7 +8,7 @@ fn main() {
     let path = if args.len() == 2 {
         args[1].clone()
     } else {
-        "::memory::".to_string()
+        panic!("usage: {} <filename>", args[0]);
     };
     let mut table = Table::new(path);
 
@@ -78,22 +78,19 @@ fn sqlite3_step(stmt: Sqlite3Stmt, table: &mut Table) {
     let vdbe = stmt.0;
     match vdbe.stmt {
         Statement::Select(_select_stmt) => {
-            if table.rows.is_empty() {
-                table.deserialize();
-            }
-            for row in &table.rows {
-                println!("{row:#?}");
+            for page in table.pager.iter_mut() {
+                for row in page.iter() {
+                    println!("{row}");
+                }
             }
         }
         Statement::Insert(insert_stmt) => {
-            table.rows.push(insert_stmt.row);
+            table.insert(insert_stmt.row);
         }
         Statement::Commit => {
             // persist table data into file
-            match table.serialize() {
-                Ok(_) => println!("commit OK"),
-                Err(err) => println!("{err:?}"),
-            }
+            table.pager.flush();
+            println!("commit OK");
         }
         _ => {}
     }
@@ -151,198 +148,362 @@ impl Row {
     /// write String to disk using '<length><value>' format
     /// if '<length>' is zero, then no '<value>' is written!
     /// The '<length>' occupies 4 bytes.
-    fn serialize(&self, out: &mut [u8]) {
+    fn serialize(&self, out: &mut Vec<u8>) -> usize {
+        let mut nbytes = 0;
         match &self.f1 {
             Some(value) => {
-                out.extend((value.len() as u32).to_be_bytes());
-                out.extend(value.clone().as_bytes());
+                out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+                out.extend_from_slice(value.as_bytes());
+                nbytes += std::mem::size_of::<u32>() + value.len();
             }
             None => {
-                out.extend(0u32.to_be_bytes());
+                out.extend_from_slice(&0u32.to_be_bytes());
+                nbytes += std::mem::size_of::<u32>();
             }
         }
         match &self.f2 {
             Some(value) => {
-                out.extend((value.len() as u32).to_be_bytes());
-                out.extend(value.clone().as_bytes());
+                out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+                out.extend_from_slice(value.as_bytes());
+                nbytes += std::mem::size_of::<u32>() + value.len();
             }
             None => {
-                out.extend(0u32.to_be_bytes());
+                out.extend_from_slice(&0u32.to_be_bytes());
+                nbytes += std::mem::size_of::<u32>();
             }
         }
         match &self.f3 {
             Some(value) => {
-                out.extend((value.len() as u32).to_be_bytes());
-                out.extend(value.clone().as_bytes());
+                out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+                out.extend_from_slice(value.as_bytes());
+                nbytes += std::mem::size_of::<u32>() + value.len();
             }
             None => {
-                out.extend(0u32.to_be_bytes());
+                out.extend_from_slice(&0u32.to_be_bytes());
+                nbytes += std::mem::size_of::<u32>();
             }
         }
+
+        nbytes
     }
 
-    fn deserialize(input: &mut File) -> std::io::Result<Self> {
+    fn deserialize(input: &[u8]) -> Option<(Row, usize)> {
         let mut row = Row::new();
 
-        let mut len_buf = [0u8; 4];
-        input.read_exact(&mut len_buf)?;
-        let len = u32::from_be_bytes(len_buf);
+        let len_size = std::mem::size_of::<u32>();
+        let mut tot_len: usize = len_size;
+        if input.len() < tot_len {
+            return None;
+        }
+        let len = u32::from_be_bytes([
+            input[tot_len - 4],
+            input[tot_len - 3],
+            input[tot_len - 2],
+            input[tot_len - 1],
+        ]);
         if len == 0 {
             row.f1 = None;
         } else {
-            let mut buf = vec![0u8; len as usize];
-            input.read_exact(&mut buf)?;
-            row.f1 = Some(String::from_utf8(buf).unwrap());
+            let len = len as usize;
+            tot_len += len;
+            if input.len() < tot_len {
+                return None;
+            }
+            row.f1 = Some(String::from_utf8(input[tot_len - len..tot_len].to_vec()).unwrap());
         }
 
-        let mut len_buf = [0u8; 4];
-        input.read_exact(&mut len_buf)?;
-        let len = u32::from_be_bytes(len_buf);
+        // deserialize f2
+        tot_len += len_size;
+        if input.len() < tot_len {
+            return None;
+        }
+        let len = u32::from_be_bytes([
+            input[tot_len - 4],
+            input[tot_len - 3],
+            input[tot_len - 2],
+            input[tot_len - 1],
+        ]);
         if len == 0 {
             row.f2 = None;
         } else {
-            let mut buf = vec![0u8; len as usize];
-            input.read_exact(&mut buf)?;
-            row.f2 = Some(String::from_utf8(buf).unwrap());
+            let len = len as usize;
+            tot_len += len;
+            if input.len() < tot_len {
+                return None;
+            }
+
+            row.f2 = Some(String::from_utf8(input[tot_len - len..tot_len].to_vec()).unwrap());
         }
 
-        let mut len_buf = [0u8; 4];
-        input.read_exact(&mut len_buf)?;
-        let len = u32::from_be_bytes(len_buf);
+        // deserialize f3
+        tot_len += len_size;
+        if input.len() < tot_len {
+            return None;
+        }
+        let len = u32::from_be_bytes([
+            input[tot_len - 4],
+            input[tot_len - 3],
+            input[tot_len - 2],
+            input[tot_len - 1],
+        ]);
         if len == 0 {
             row.f3 = None;
         } else {
-            let mut buf = vec![0u8; len as usize];
-            input.read_exact(&mut buf)?;
-            row.f3 = Some(String::from_utf8(buf).unwrap());
+            let len = len as usize;
+            tot_len += len;
+            if input.len() < tot_len {
+                return None;
+            }
+
+            row.f3 = Some(String::from_utf8(input[tot_len - len..tot_len].to_vec()).unwrap());
         }
 
-        Ok(row)
+        Some((row, tot_len))
     }
 }
 
-const PAGE_SIZE: usize = 4096;
+impl std::fmt::Display for Row {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(f1) = &self.f1 {
+            write!(f, "{f1}")?;
+        } else {
+            write!(f, "null")?;
+        }
+        write!(f, "|")?;
+        if let Some(f2) = &self.f2 {
+            write!(f, "{f2}")?;
+        } else {
+            write!(f, "null")?;
+        }
+        write!(f, "|")?;
+        if let Some(f3) = &self.f3 {
+            write!(f, "{f3}")?;
+        } else {
+            write!(f, "null")?;
+        }
+        write!(f, "")
+    }
+}
 
+const PAGE_SIZE: usize = 40;
+const PAGE_HEADER_SIZE: usize = 2;
+
+#[derive(Debug, Clone, Copy)]
 struct Page {
     data: [u8; PAGE_SIZE],
-    len: u32,
+    len: u16,
+    dirty: bool,
 }
 
 impl Page {
     fn new() -> Self {
         Self {
-            data: [0; 4096],
-            len: 0,
+            data: [0; PAGE_SIZE],
+            // page header length
+            len: PAGE_HEADER_SIZE as u16,
+            dirty: false,
         }
     }
 
-    fn len(&self) -> u32 {
-        self.len
+    fn create_from_buf(buf: [u8; PAGE_SIZE]) -> Self {
+        // get page payload length
+        let len = u16::from_be_bytes([buf[0], buf[1]]);
+        Self {
+            data: buf,
+            len,
+            dirty: false,
+        }
     }
 
-    fn is_empty(&self) -> bool {
-        self.len() == 0
+    fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
-    fn insert(&mut self, row: Row) {
-        row.serialize(&mut self.data);
+    fn set_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// return true only if the page has enough space to hold the row
+    fn insert(&mut self, row: &Row) -> bool {
+        let mut buf = vec![];
+        row.serialize(&mut buf);
+        if PAGE_SIZE - (self.len as usize) < buf.len() {
+            false
+        } else {
+            let len = self.len as usize;
+            self.data[len..len + buf.len()].copy_from_slice(&buf);
+            self.len += buf.len() as u16;
+            // update page header
+            self.data[0..PAGE_HEADER_SIZE].copy_from_slice(&self.len.to_be_bytes());
+            self.set_dirty();
+            true
+        }
+    }
+
+    fn get_row_at(&self, offset: usize) -> Option<(Row, usize)> {
+        Row::deserialize(&self.data[PAGE_HEADER_SIZE + offset..self.len as usize])
+    }
+
+    fn iter(&self) -> PageIterator<'_> {
+        PageIterator {
+            page: self,
+            row_offset: 0,
+        }
+    }
+}
+
+struct PageIterator<'a> {
+    page: &'a Page,
+    row_offset: usize,
+}
+
+impl<'a> Iterator for PageIterator<'a> {
+    type Item = Row;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let row = self.page.get_row_at(self.row_offset);
+        if let Some((row, row_size)) = row {
+            self.row_offset += row_size;
+            Some(row)
+        } else {
+            None
+        }
     }
 }
 
 struct Pager {
-    pages: Vec<Page>,
-    source: Option<File>,
+    pages: Vec<Option<Page>>,
+    source: File,
+    num_phy_pages: u64,
+}
+
+impl Pager {
+    fn new(path: String) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let file_size = file.metadata()?.len();
+        assert!(file_size % PAGE_SIZE as u64 == 0);
+        let num_phy_pages = file_size / PAGE_SIZE as u64;
+        println!("num_phy_pages {num_phy_pages}");
+        let pages = vec![None; num_phy_pages as usize];
+        Ok(Self {
+            pages,
+            source: file,
+            num_phy_pages,
+        })
+    }
+
+    fn get_page_mut(&mut self, page_no: usize) -> Option<&mut Page> {
+        if page_no != 0 && page_no <= self.num_phy_pages as usize {
+            let page_no = page_no - 1;
+            if self.pages[page_no].is_none() {
+                let mut buf = [0u8; PAGE_SIZE];
+                let _ = self
+                    .source
+                    .seek(SeekFrom::Start((page_no * PAGE_SIZE) as u64));
+                let _ = self.source.read_exact(&mut buf);
+                let page = Page::create_from_buf(buf);
+                self.pages[page_no] = Some(page);
+            }
+            self.pages[page_no].as_mut()
+        } else {
+            None
+        }
+    }
+
+    fn new_page(&mut self) -> std::io::Result<&mut Page> {
+        self.num_phy_pages += 1;
+        self.source.set_len(self.num_phy_pages * PAGE_SIZE as u64)?;
+        let page = Page::new();
+        self.pages.push(Some(page));
+        Ok(self.pages.last_mut().unwrap().as_mut().unwrap())
+    }
+
+    fn flush(&mut self) {
+        for (page_no, page) in self.pages.iter().enumerate() {
+            if let Some(page) = page {
+                if page.is_dirty() {
+                    let _ = self
+                        .source
+                        .seek(SeekFrom::Start((page_no * PAGE_SIZE) as u64));
+                    let _ = self.source.write_all(&page.data);
+                    let _ = self.source.flush();
+                }
+            }
+        }
+    }
+
+    fn iter_mut(&mut self) -> PagerIterator<'_> {
+        PagerIterator {
+            pager: self,
+            current_page: 1,
+        }
+    }
+}
+
+struct PagerIterator<'a> {
+    pager: &'a mut Pager,
+    current_page: usize,
+}
+
+impl<'a> Iterator for PagerIterator<'a> {
+    type Item = Page;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_page <= self.pager.num_phy_pages as usize {
+            let page = self.pager.get_page_mut(self.current_page);
+            self.current_page += 1;
+            // copy
+            page.map(|page| *page)
+        } else {
+            None
+        }
+    }
 }
 
 struct Table {
-    num_pages: u64,
     // table object uses pager object to fetch pages
     pager: Pager,
+    writing_page: u64,
 }
 
 impl Table {
     fn new(path: String) -> Self {
-        Self {
-            num_pages: 0,
-            pager: Pager::new(path),
-        }
-    }
-
-    fn serialize(&mut self) -> std::io::Result<()> {
-        self.pager.serialize()
-    }
-
-    fn deserialize(&mut self) {
-        self.pager.deserialize();
-    }
-
-    fn insert(&mut self, row: Row) {
-        self.pager.insert(row);
-    }
-    
-    fn seq_scan(&self) -> TableIterator {
-        todo!("")
-    }
-}
-
-struct TableIterator {
-
-}
-
-impl Pager {
-    fn new(path: String) -> Self {
-        let file = if path == "::memory::" {
-            None
-        } else {
-            Some(
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(path)
-                    .unwrap()
-            )
+        let pager = match Pager::new(path) {
+            Ok(p) => p,
+            Err(err) => panic!("{err}"),
         };
+        let writing_page = pager.num_phy_pages;
         Self {
-            pages: vec![],
-            source: file,
+            pager,
+            writing_page,
         }
-    }
-
-    fn get(&self, page_no: u64) -> Page {
-        todo!("")
-    }
-
-    fn flush(&mut self) {
-        todo!("")
     }
 
     fn insert(&mut self, row: Row) {
-        // append-only
-        self.pages
-    }
-
-    fn serialize(&mut self) -> std::io::Result<()> {
-        if self.pager.is_none() {
-            return Ok(());
+        let mut need_new_page = false;
+        match self.pager.get_page_mut(self.writing_page as usize) {
+            Some(page) => {
+                if !page.insert(&row) {
+                    need_new_page = true;
+                }
+            }
+            None => need_new_page = true,
         }
-        let pager = self.pager.as_mut().unwrap();
-        // write from the beginning
-        pager.seek(std::io::SeekFrom::Start(0))?;
-        for row in &self.rows {
-            row.serialize(pager);
-        }
-        Ok(())
-    }
-
-    fn deserialize(&mut self) {
-        if self.pager.is_none() {
-            return;
-        }
-        let pager = self.pager.as_mut().unwrap();
-        while let Ok(row) = Row::deserialize(pager) {
-            self.rows.push(row);
+        if need_new_page {
+            match self.pager.new_page() {
+                Ok(page) => {
+                    if !page.insert(&row) {
+                        panic!("can not insert page");
+                    }
+                    self.writing_page += 1;
+                }
+                Err(err) => panic!("{err:?}"),
+            }
         }
     }
 }
