@@ -288,11 +288,84 @@ impl std::fmt::Display for Row {
 const PAGE_SIZE: usize = 40;
 const PAGE_HEADER_SIZE: usize = 2;
 
+/// page structure:
+///
+/// page type + num cells
 #[derive(Debug, Clone, Copy)]
 struct Page {
     data: [u8; PAGE_SIZE],
     len: u16,
     dirty: bool,
+}
+
+enum PageType {
+    Leaf = 0,
+    Interior = 1,
+}
+
+impl From<u8> for PageType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => PageType::Leaf,
+            1 => PageType::Interior,
+            _ => panic!("invalid page type value"),
+        }
+    }
+}
+
+impl From<PageType> for u8 {
+    fn from(value: PageType) -> Self {
+        match value {
+            PageType::Leaf => PageType::Leaf as u8,
+            PageType::Interior => PageType::Interior as u8,
+        }
+    }
+}
+
+/// utilities for accessing page structure
+/// https://devnotes.ldd.cool/notes-sqlite/update_flow#database-file-format
+impl Page {
+    const PAGE_TYPE_OFFSET: usize = 0;
+    const PAGE_TYPE_SIZE: usize = 1;
+    const NUM_CELLS_OFFSET: usize = 1;
+    const NUM_CELLS_SIZE: usize = 2;
+    const CELL_POINTER_OFFSET: usize = 3;
+    const CELL_POINTER_SIZE: usize = 2;
+
+    fn page_type(&self) -> PageType {
+        u8::from_be_bytes([self.data[Page::PAGE_TYPE_OFFSET]]).into()
+    }
+
+    fn set_page_type(&mut self, pt: PageType) {
+        self.data[Page::PAGE_TYPE_OFFSET..Page::PAGE_TYPE_SIZE]
+            .copy_from_slice(&<PageType as Into<u8>>::into(pt).to_be_bytes());
+    }
+
+    fn num_cells(&self) -> u16 {
+        u16::from_be_bytes([
+            self.data[Page::NUM_CELLS_OFFSET],
+            self.data[Page::NUM_CELLS_OFFSET + 1],
+        ])
+    }
+
+    fn set_num_cells(&mut self, n: u16) {
+        self.data[Page::NUM_CELLS_OFFSET..Page::NUM_CELLS_OFFSET + Page::NUM_CELLS_SIZE]
+            .copy_from_slice(&n.to_be_bytes());
+    }
+
+    fn cell_offset(&self, n: u16) -> u16 {
+        let cell_pointer_offset = n as usize * Page::CELL_POINTER_SIZE;
+        u16::from_be_bytes([
+            self.data[cell_pointer_offset],
+            self.data[cell_pointer_offset + 1],
+        ])
+    }
+
+    fn set_cell_offset(&mut self, n: u16, offset: u16) {
+        let cell_pointer_offset = n as usize * Page::CELL_POINTER_SIZE;
+        self.data[cell_pointer_offset..cell_pointer_offset + 1]
+            .copy_from_slice(&offset.to_be_bytes());
+    }
 }
 
 impl Page {
