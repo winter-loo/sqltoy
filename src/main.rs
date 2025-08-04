@@ -55,11 +55,11 @@ fn sqlite3_prepare(line: &str) -> Result<Sqlite3Stmt, String> {
                 "select" => Statement::Select(SelectStatement {}),
                 "create" => Statement::Create(CreateTableStmt {}),
                 "insert" => Statement::Insert(InsertStatement {
-                    row: Row {
-                        f1: tokens.next().map(|s| s.to_string()),
-                        f2: tokens.next().map(|s| s.to_string()),
-                        f3: tokens.next().map(|s| s.to_string()),
-                    },
+                    row: Row::new(
+                        tokens.next().map(|s| s.to_string()),
+                        tokens.next().map(|s| s.to_string()),
+                        tokens.next().map(|s| s.to_string()),
+                    ),
                 }),
                 "delete" => Statement::Delete(DeleteStatement {}),
                 "update" => Statement::Update(UpdateStatement {}),
@@ -134,15 +134,60 @@ struct Row {
     f1: Option<String>,
     f2: Option<String>,
     f3: Option<String>,
+    len: usize,
 }
 
 impl Row {
-    fn new() -> Self {
-        Self {
-            f1: None,
-            f2: None,
-            f3: None,
+    fn new(f1: Option<String>, f2: Option<String>, f3: Option<String>) -> Self {
+        let header_len = std::mem::size_of::<u32>();
+        let len = 3 * header_len
+            + f1.as_ref().map(|s| s.len()).unwrap_or(0)
+            + f2.as_ref().map(|s| s.len()).unwrap_or(0)
+            + f3.as_ref().map(|s| s.len()).unwrap_or(0);
+
+        Self { f1, f2, f3, len }
+    }
+
+    /// write String to disk using '<length><value>' format
+    /// if '<length>' is zero, then no '<value>' is written!
+    /// The '<length>' occupies 4 bytes.
+    fn serialize_to_slice(&self, out: &mut [u8]) -> usize {
+        let mut nbytes = 0;
+        match &self.f1 {
+            Some(value) => {
+                out[nbytes..nbytes + 4].copy_from_slice(&(value.len() as u32).to_be_bytes());
+                out[nbytes + 4..nbytes + 4 + value.len()].copy_from_slice(value.as_bytes());
+                nbytes += std::mem::size_of::<u32>() + value.len();
+            }
+            None => {
+                out[nbytes..nbytes + 4].copy_from_slice(&0u32.to_be_bytes());
+                nbytes += std::mem::size_of::<u32>();
+            }
         }
+        match &self.f2 {
+            Some(value) => {
+                out[nbytes..nbytes + 4].copy_from_slice(&(value.len() as u32).to_be_bytes());
+                out[nbytes + 4..nbytes + 4 + value.len()].copy_from_slice(value.as_bytes());
+                nbytes += std::mem::size_of::<u32>() + value.len();
+            }
+            None => {
+                out[nbytes..nbytes + 4].copy_from_slice(&0u32.to_be_bytes());
+                nbytes += std::mem::size_of::<u32>();
+            }
+        }
+        match &self.f3 {
+            Some(value) => {
+                out[nbytes..nbytes + 4].copy_from_slice(&(value.len() as u32).to_be_bytes());
+                out[nbytes + 4..nbytes + 4 + value.len()].copy_from_slice(value.as_bytes());
+                nbytes += std::mem::size_of::<u32>() + value.len();
+            }
+            None => {
+                out[nbytes..nbytes + 4].copy_from_slice(&0u32.to_be_bytes());
+                nbytes += std::mem::size_of::<u32>();
+            }
+        }
+
+        nbytes
     }
 
     /// write String to disk using '<length><value>' format
@@ -187,78 +232,65 @@ impl Row {
         nbytes
     }
 
-    fn deserialize(input: &[u8]) -> Option<(Row, usize)> {
-        let mut row = Row::new();
-
+    fn deserialize(input: &[u8]) -> Option<Row> {
         let len_size = std::mem::size_of::<u32>();
         let mut tot_len: usize = len_size;
-        if input.len() < tot_len {
-            return None;
-        }
+        assert!(input.len() >= tot_len);
+
         let len = u32::from_be_bytes([
             input[tot_len - 4],
             input[tot_len - 3],
             input[tot_len - 2],
             input[tot_len - 1],
         ]);
-        if len == 0 {
-            row.f1 = None;
+        let f1 = if len == 0 {
+            None
         } else {
             let len = len as usize;
             tot_len += len;
-            if input.len() < tot_len {
-                return None;
-            }
-            row.f1 = Some(String::from_utf8(input[tot_len - len..tot_len].to_vec()).unwrap());
-        }
+            assert!(input.len() >= tot_len);
+            Some(String::from_utf8(input[tot_len - len..tot_len].to_vec()).unwrap())
+        };
 
         // deserialize f2
         tot_len += len_size;
-        if input.len() < tot_len {
-            return None;
-        }
+        assert!(input.len() >= tot_len);
         let len = u32::from_be_bytes([
             input[tot_len - 4],
             input[tot_len - 3],
             input[tot_len - 2],
             input[tot_len - 1],
         ]);
-        if len == 0 {
-            row.f2 = None;
+        let f2 = if len == 0 {
+            None
         } else {
             let len = len as usize;
             tot_len += len;
-            if input.len() < tot_len {
-                return None;
-            }
+            assert!(input.len() >= tot_len);
 
-            row.f2 = Some(String::from_utf8(input[tot_len - len..tot_len].to_vec()).unwrap());
-        }
+            Some(String::from_utf8(input[tot_len - len..tot_len].to_vec()).unwrap())
+        };
 
         // deserialize f3
         tot_len += len_size;
-        if input.len() < tot_len {
-            return None;
-        }
+        assert!(input.len() >= tot_len);
         let len = u32::from_be_bytes([
             input[tot_len - 4],
             input[tot_len - 3],
             input[tot_len - 2],
             input[tot_len - 1],
         ]);
-        if len == 0 {
-            row.f3 = None;
+        let f3 = if len == 0 {
+            None
         } else {
             let len = len as usize;
             tot_len += len;
-            if input.len() < tot_len {
-                return None;
-            }
+            assert!(input.len() >= tot_len);
 
-            row.f3 = Some(String::from_utf8(input[tot_len - len..tot_len].to_vec()).unwrap());
-        }
+            Some(String::from_utf8(input[tot_len - len..tot_len].to_vec()).unwrap())
+        };
 
-        Some((row, tot_len))
+        Some(Row::new(f1, f2, f3))
     }
 }
 
@@ -285,8 +317,10 @@ impl std::fmt::Display for Row {
     }
 }
 
-const PAGE_SIZE: usize = 40;
-const PAGE_HEADER_SIZE: usize = 2;
+#[cfg(feature = "debug_page_layout")]
+const PAGE_SIZE: usize = 32;
+#[cfg(not(feature = "debug_page_layout"))]
+const PAGE_SIZE: usize = 4096;
 
 /// page structure:
 ///
@@ -294,21 +328,28 @@ const PAGE_HEADER_SIZE: usize = 2;
 #[derive(Debug, Clone, Copy)]
 struct Page {
     data: [u8; PAGE_SIZE],
-    len: u16,
     dirty: bool,
 }
 
 enum PageType {
-    Leaf = 0,
-    Interior = 1,
+    IndexInterior = 2,
+    TableInterior = 5,
+    IndexLeaf = 10,
+    TableLeaf = 13,
 }
 
 impl From<u8> for PageType {
     fn from(value: u8) -> Self {
-        match value {
-            0 => PageType::Leaf,
-            1 => PageType::Interior,
-            _ => panic!("invalid page type value"),
+        if value == PageType::IndexInterior as u8 {
+            PageType::IndexInterior
+        } else if value == PageType::TableInterior as u8 {
+            PageType::TableInterior
+        } else if value == PageType::IndexLeaf as u8 {
+            PageType::IndexLeaf
+        } else if value == PageType::TableLeaf as u8 {
+            PageType::TableLeaf
+        } else {
+            panic!("invalid page type value");
         }
     }
 }
@@ -316,20 +357,31 @@ impl From<u8> for PageType {
 impl From<PageType> for u8 {
     fn from(value: PageType) -> Self {
         match value {
-            PageType::Leaf => PageType::Leaf as u8,
-            PageType::Interior => PageType::Interior as u8,
+            PageType::IndexInterior => PageType::IndexInterior as u8,
+            PageType::TableInterior => PageType::TableInterior as u8,
+            PageType::IndexLeaf => PageType::IndexLeaf as u8,
+            PageType::TableLeaf => PageType::TableLeaf as u8,
         }
     }
 }
+
+struct PageNo(u32);
 
 /// utilities for accessing page structure
 /// https://devnotes.ldd.cool/notes-sqlite/update_flow#database-file-format
 impl Page {
     const PAGE_TYPE_OFFSET: usize = 0;
     const PAGE_TYPE_SIZE: usize = 1;
-    const NUM_CELLS_OFFSET: usize = 1;
+    const FIRST_FREE_BLOCK_OFFSET: usize = 1;
+    const FIRST_FREE_BLOCK_SIZE: usize = 2;
+    const NUM_CELLS_OFFSET: usize = 3;
     const NUM_CELLS_SIZE: usize = 2;
-    const CELL_POINTER_OFFSET: usize = 3;
+    const CELL_START_OFFSET: usize = 5;
+    const CELL_START_SIZE: usize = 2;
+    const NUM_FRAGMENTED_OFFSET: usize = 7;
+    const NUM_FRAGMENTED_SIZE: usize = 1;
+    const RIGHT_CHILD_OFFSET: usize = 8;
+    const RIGHT_CHILD_SIZE: usize = 4;
     const CELL_POINTER_SIZE: usize = 2;
 
     fn page_type(&self) -> PageType {
@@ -337,8 +389,7 @@ impl Page {
     }
 
     fn set_page_type(&mut self, pt: PageType) {
-        self.data[Page::PAGE_TYPE_OFFSET..Page::PAGE_TYPE_SIZE]
-            .copy_from_slice(&<PageType as Into<u8>>::into(pt).to_be_bytes());
+        self.data[Page::PAGE_TYPE_OFFSET] = pt.into();
     }
 
     fn num_cells(&self) -> u16 {
@@ -353,39 +404,251 @@ impl Page {
             .copy_from_slice(&n.to_be_bytes());
     }
 
-    fn cell_offset(&self, n: u16) -> u16 {
-        let cell_pointer_offset = n as usize * Page::CELL_POINTER_SIZE;
+    fn cell_start(&self) -> u16 {
         u16::from_be_bytes([
-            self.data[cell_pointer_offset],
-            self.data[cell_pointer_offset + 1],
+            self.data[Page::CELL_START_OFFSET],
+            self.data[Page::CELL_START_OFFSET + 1],
         ])
     }
 
-    fn set_cell_offset(&mut self, n: u16, offset: u16) {
-        let cell_pointer_offset = n as usize * Page::CELL_POINTER_SIZE;
-        self.data[cell_pointer_offset..cell_pointer_offset + 1]
+    fn set_cell_start(&mut self, offset: u16) {
+        // why use this cubersome style? `copy_from_slice` will check source and
+        // destination length. If they do not match, panic!
+        self.data[Page::CELL_START_OFFSET..Page::CELL_START_OFFSET + Page::CELL_START_SIZE]
             .copy_from_slice(&offset.to_be_bytes());
+    }
+
+    /// the length of un-allocated page space
+    fn unused_len(&self) -> usize {
+        let cell_pointers_len = (self.num_cells() as usize) * Page::CELL_POINTER_SIZE;
+        let cell_pointers_tail = self.cell_pointer_offset() + cell_pointers_len;
+        self.cell_start() as usize - cell_pointers_tail
+    }
+
+    fn cell_pointer_offset(&self) -> usize {
+        match self.page_type() {
+            PageType::IndexInterior | PageType::TableInterior => {
+                Page::RIGHT_CHILD_OFFSET + Page::RIGHT_CHILD_SIZE
+            }
+            PageType::IndexLeaf | PageType::TableLeaf => {
+                Page::NUM_FRAGMENTED_OFFSET + Page::NUM_FRAGMENTED_SIZE
+            }
+        }
+    }
+
+    fn cell_offset(&self, n: u16) -> usize {
+        let cell_pointer_start = self.cell_pointer_offset();
+        let cell_pointer_offset = cell_pointer_start
+            + if n == 0 {
+                0
+            } else {
+                (n - 1) as usize * Page::CELL_POINTER_SIZE
+            };
+        u16::from_be_bytes([
+            self.data[cell_pointer_offset],
+            self.data[cell_pointer_offset + 1],
+        ]) as usize
+    }
+
+    fn set_cell_offset(&mut self, n: u16, offset: u16) {
+        let cell_pointer_start = self.cell_pointer_offset();
+        let off = cell_pointer_start
+            + if n == 0 {
+                0
+            } else {
+                (n - 1) as usize * Page::CELL_POINTER_SIZE
+            };
+        self.data[off..off + Page::CELL_POINTER_SIZE].copy_from_slice(&offset.to_be_bytes());
+    }
+
+    fn get_cell(&self, n: u16) -> Cell<'_> {
+        let cell = &self.data[dbg!(self.cell_offset(n))..];
+        match self.page_type() {
+            PageType::TableLeaf => Cell::TableLeaf(TableLeafCell::deserialize(cell)),
+            PageType::TableInterior => Cell::TableInterior(TableInteriorCell::parse(cell)),
+            PageType::IndexLeaf => Cell::IndexLeaf(IndexLeafCell::parse(cell)),
+            PageType::IndexInterior => Cell::IndexInterior(IndexInteriorCell::parse(cell)),
+        }
+    }
+}
+
+enum Cell<'a> {
+    TableLeaf(TableLeafCell<'a>),
+    TableInterior(TableInteriorCell),
+    IndexLeaf(IndexLeafCell<'a>),
+    IndexInterior(IndexInteriorCell<'a>),
+}
+
+struct TableLeafCell<'a> {
+    rowid: u64,
+    payload: &'a [u8],
+}
+
+impl<'a> TableLeafCell<'a> {
+    fn deserialize(data: &'a [u8]) -> Self {
+        // first varint: number of bytes of payload
+        let Varint {
+            value: payload_len,
+            len: offset1,
+        } = Varint::read_from_slice(data).unwrap();
+
+        // second varint: rowid
+        let Varint {
+            value: rowid,
+            len: offset2,
+        } = Varint::read_from_slice(&data[offset1..]).unwrap();
+        println!("payload_len {payload_len}");
+
+        // deserialize payload and the page number of the first overflow page
+        let payload = if payload_len as usize > PAGE_SIZE - offset1 - offset2 {
+            let off = PAGE_SIZE - std::mem::size_of::<PageNo>();
+            let _first_overflow_page = Some(PageNo(u32::from_be_bytes([
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+            ])));
+
+            let _payload = todo!("read from next page");
+        } else {
+            let off = offset1 + offset2;
+            &data[off..off + payload_len as usize]
+        };
+        Self { rowid, payload }
+    }
+
+    fn serialize(row: &Row, cell_content: &mut [u8]) {
+        // 1. write the first varint
+        let mut off = Varint::into_bytes(row.len as u64, cell_content);
+
+        // 2. write the second varint
+        off += Varint::into_bytes(0, cell_content);
+
+        // 3. write payload
+        // Assume no large data written into a row
+        // TODO: handle overflow page
+        assert!(row.len < PAGE_SIZE - off);
+        row.serialize_to_slice(&mut cell_content[off..off + row.len]);
+    }
+
+    fn get_row(&self) -> Row {
+        Row::deserialize(self.payload).unwrap()
+    }
+}
+
+struct TableInteriorCell {
+    left_child: PageNo,
+    rowid: u64,
+}
+
+impl TableInteriorCell {
+    fn parse(data: &[u8]) -> Self {
+        let left_child = PageNo(u32::from_be_bytes([data[0], data[1], data[2], data[3]]));
+        let rowid = Varint::read_from_slice(&data[4..]).unwrap().value;
+        Self { left_child, rowid }
+    }
+}
+
+struct IndexLeafCell<'a> {
+    payload: &'a [u8],
+}
+
+impl<'a> IndexLeafCell<'a> {
+    fn parse(data: &'a [u8]) -> Self {
+        let Varint {
+            value: payload_len,
+            len: offset1,
+        } = Varint::read_from_slice(data).unwrap();
+        let payload = if payload_len as usize > PAGE_SIZE - offset1 {
+            let off = PAGE_SIZE - std::mem::size_of::<PageNo>();
+            let _first_overflow_page = Some(PageNo(u32::from_be_bytes([
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+            ])));
+            let _payload = todo!("read from next page");
+        } else {
+            &data[offset1..offset1 + payload_len as usize]
+        };
+        Self { payload }
+    }
+}
+
+struct IndexInteriorCell<'a> {
+    left_child: PageNo,
+    payload: &'a [u8],
+}
+
+impl<'a> IndexInteriorCell<'a> {
+    fn parse(data: &'a [u8]) -> Self {
+        let left_child = PageNo(u32::from_be_bytes([data[0], data[1], data[2], data[3]]));
+        let offset1 = std::mem::size_of::<u32>();
+        let Varint {
+            value: payload_len,
+            len: offset2,
+        } = Varint::read_from_slice(&data[offset1..]).unwrap();
+        let off = offset1 + offset2;
+        let payload = if payload_len as usize > PAGE_SIZE - off {
+            todo!("read from next page")
+        } else {
+            &data[off..off + payload_len as usize]
+        };
+        Self {
+            left_child,
+            payload,
+        }
+    }
+}
+
+struct Varint {
+    value: u64,
+    len: usize,
+}
+
+impl Varint {
+    fn read_from_slice(buf: &[u8]) -> Option<Varint> {
+        let mut sum = 0u64;
+        let mut i = 0;
+        while i < buf.len() {
+            if i == 9 {
+                return None;
+            }
+            let n = buf[i];
+            i += 1;
+            if n & 0x80 == 0 {
+                sum += n as u64;
+                break;
+            }
+            sum += (n & 0x7f) as u64;
+        }
+        assert!(i <= buf.len());
+        Some(Varint { value: sum, len: i })
+    }
+
+    fn into_bytes(value: u64, buf: &mut [u8]) -> usize {
+        todo!()
     }
 }
 
 impl Page {
-    fn new() -> Self {
-        Self {
-            data: [0; PAGE_SIZE],
-            // page header length
-            len: PAGE_HEADER_SIZE as u16,
+    fn create_table_leaf_page() -> Self {
+        let mut page = Page {
+            data: [0u8; PAGE_SIZE],
             dirty: false,
-        }
+        };
+        page.set_page_type(PageType::TableLeaf);
+        page.set_cell_start(PAGE_SIZE as u16);
+        page
     }
 
     fn create_from_buf(buf: [u8; PAGE_SIZE]) -> Self {
-        // get page payload length
-        let len = u16::from_be_bytes([buf[0], buf[1]]);
-        Self {
+        let page = Page {
             data: buf,
-            len,
             dirty: false,
-        }
+        };
+        assert!(matches!(page.page_type(), PageType::TableLeaf));
+        page
     }
 
     fn is_dirty(&self) -> bool {
@@ -398,48 +661,48 @@ impl Page {
 
     /// return true only if the page has enough space to hold the row
     fn insert(&mut self, row: &Row) -> bool {
-        let mut buf = vec![];
-        row.serialize(&mut buf);
-        if PAGE_SIZE - (self.len as usize) < buf.len() {
-            false
+        if row.len > self.unused_len() {
+            todo!("too long! need a new page")
         } else {
-            let len = self.len as usize;
-            self.data[len..len + buf.len()].copy_from_slice(&buf);
-            self.len += buf.len() as u16;
-            // update page header
-            self.data[0..PAGE_HEADER_SIZE].copy_from_slice(&self.len.to_be_bytes());
-            self.set_dirty();
-            true
-        }
-    }
+            // fill in some important bits
+            let cell_num = self.num_cells() + 1;
+            self.set_num_cells(cell_num);
+            let end = self.cell_start() as usize;
+            let start = end - row.len;
+            self.set_cell_offset(cell_num, start as u16);
+            self.set_cell_start(start as u16);
 
-    fn get_row_at(&self, offset: usize) -> Option<(Row, usize)> {
-        Row::deserialize(&self.data[PAGE_HEADER_SIZE + offset..self.len as usize])
+            TableLeafCell::serialize(row, &mut self.data[start..start + row.len]);
+            println!("row written to offset: {start}");
+        }
+        self.set_dirty();
+        true
     }
 
     fn iter(&self) -> PageIterator<'_> {
         PageIterator {
             page: self,
-            row_offset: 0,
+            rownum: 0,
         }
     }
 }
 
 struct PageIterator<'a> {
     page: &'a Page,
-    row_offset: usize,
+    rownum: u16,
 }
 
 impl<'a> Iterator for PageIterator<'a> {
     type Item = Row;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let row = self.page.get_row_at(self.row_offset);
-        if let Some((row, row_size)) = row {
-            self.row_offset += row_size;
-            Some(row)
-        } else {
-            None
+        if self.rownum >= self.page.num_cells() {
+            return None;
+        }
+        let cell = self.page.get_cell(self.rownum);
+        match cell {
+            Cell::TableLeaf(cell) => Some(cell.get_row()),
+            _ => todo!("decode other kinds of cells"),
         }
     }
 }
@@ -491,7 +754,7 @@ impl Pager {
     fn new_page(&mut self) -> std::io::Result<&mut Page> {
         self.num_phy_pages += 1;
         self.source.set_len(self.num_phy_pages * PAGE_SIZE as u64)?;
-        let page = Page::new();
+        let page = Page::create_table_leaf_page();
         self.pages.push(Some(page));
         Ok(self.pages.last_mut().unwrap().as_mut().unwrap())
     }
