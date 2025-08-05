@@ -601,6 +601,22 @@ impl<'a> IndexInteriorCell<'a> {
     }
 }
 
+/// The variable-length integer encoding is as follows:
+///
+/// KEY:
+///         A = 0xxxxxxx    7 bits of data and one flag bit
+///         B = 1xxxxxxx    7 bits of data and one flag bit
+///         C = xxxxxxxx    8 bits of data
+///
+///  7 bits - A
+/// 14 bits - BA
+/// 21 bits - BBA
+/// 28 bits - BBBA
+/// 35 bits - BBBBA
+/// 42 bits - BBBBBA
+/// 49 bits - BBBBBBA
+/// 56 bits - BBBBBBBA
+/// 64 bits - BBBBBBBBC
 struct Varint {
     value: u64,
     len: usize,
@@ -608,26 +624,92 @@ struct Varint {
 
 impl Varint {
     fn read_from_slice(buf: &[u8]) -> Option<Varint> {
-        let mut sum = 0u64;
-        let mut i = 0;
-        while i < buf.len() {
-            if i == 9 {
-                return None;
+        if buf.is_empty() {
+            return None;
+        }
+
+        // - read byte by byte from left to right
+        // - get the lower 7 bits from the byte, BITS = BYTE & 0x7f
+        // - check the most significant bit(MSB) of the byte
+        // - if the MSB is 1, we need get the next byte
+        // - if the MSB is 0, we are done
+        // - the algorithm to construct the final value:
+        //   BITS | (NEXT_BITS << (n * 7)) where `n` is the n-th byte
+        let mut n = 0;
+        let mut value = 0u64;
+        loop {
+            if n >= buf.len() {
+                return None; // Buffer too short
             }
-            let n = buf[i];
-            i += 1;
-            if n & 0x80 == 0 {
-                sum += n as u64;
+
+            if n >= 8 {
+                // 9th byte: store full 8 bits (no continuation bit)
+                value |= ((buf[n] as u64) << (n * 7));
+                n += 1;
                 break;
             }
-            sum += (n & 0x7f) as u64;
+
+            let bits = buf[n] & 0x7f;
+            value |= ((bits as u64) << (n * 7));
+
+            if buf[n] & 0x80 == 0 {
+                n += 1;
+                break;
+            }
+            n += 1;
         }
-        assert!(i <= buf.len());
-        Some(Varint { value: sum, len: i })
+        Some(Varint { value, len: n })
     }
 
+    /// Write a 64-bit variable-length integer to memory starting at buf[0].
+    /// The length of data write will be between 1 and 9 bytes.  The number
+    /// of bytes written is returned.
+    ///
+    /// A variable-length integer consists of the lower 7 bits of each byte
+    /// for all bytes that have the 8th bit set and one byte with the 8th
+    /// bit clear.  Except, if we get to the 9th byte, it stores the full
+    /// 8 bits and is the last byte.
     fn into_bytes(value: u64, buf: &mut [u8]) -> usize {
-        todo!()
+        if value <= 0x7f {
+            buf[0] = value as u8;
+            return 1;
+        }
+
+        // 0b0011_1111_1111_1111
+        if value <= 0x3fff {
+            buf[0] = ((value & 0x7f) | 0x80) as u8;
+            buf[1] = (value >> 7) as u8;
+            return 2;
+        }
+
+        let msb = value & ((0xff000000_u64) << 32);
+        if msb > 0 {
+            buf[8] = msb as u8;
+            let mut value = value;
+            for byte in buf[0..8].as_mut() {
+                *byte = ((value & 0x7f) | 0x80) as u8;
+                value >>= 7;
+            }
+            return 9;
+        }
+
+        // Now handle a value less than (value & ((xff000000_u64) << 32))
+        //
+        // - read 7 bits as a group from left to right of `value`
+        // - add a marker bit in the 8th bit
+        // - put the new 8 bits into the `buf` from left to right
+        let mut n = 0;
+        let mut bits = value;
+        while bits != 0 {
+            let v = (bits & 0x7f) | 0x80;
+            buf[n] = v as u8;
+            bits >>= 7;
+            n += 1;
+        }
+        // reset the most significant bit of the last byte
+        buf[n] &= 0x7f;
+
+        n
     }
 }
 
@@ -841,5 +923,183 @@ impl Table {
                 Err(err) => panic!("{err:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn varint_test() {
+        let n = 10;
+        let mut buf = [0u8; 10];
+        let k = Varint::into_bytes(n, &mut buf);
+        let varint = Varint::read_from_slice(&buf[0..k]).unwrap();
+        assert_eq!(varint.value, n);
+        assert_eq!(varint.len, 1);
+    }
+
+    #[test]
+    fn varint_comprehensive_test() {
+        // Test edge case: zero
+        test_varint_roundtrip(0);
+
+        // Test single byte values (0-127)
+        test_varint_roundtrip(1);
+        test_varint_roundtrip(127);
+
+        // Test two byte values (128-16383)
+        test_varint_roundtrip(128);
+        test_varint_roundtrip(16383);
+
+        // Test boundary values for different byte lengths
+        test_varint_roundtrip(0x7f); // 1 byte max
+        test_varint_roundtrip(0x80); // 2 byte min
+        test_varint_roundtrip(0x3fff); // 2 byte max
+        // FIX:
+        test_varint_roundtrip(0x4000); // 3 byte min
+        test_varint_roundtrip(0x1fffff); // 3 byte max
+        test_varint_roundtrip(0x200000); // 4 byte min
+        test_varint_roundtrip(0xfffffff); // 4 byte max
+        test_varint_roundtrip(0x10000000); // 5 byte min
+
+        // Test larger values
+        test_varint_roundtrip(0x7fffffff); // 5 byte max
+        test_varint_roundtrip(0x80000000); // 6 byte min
+        test_varint_roundtrip(0x3fffffffff); // 6 byte max
+        test_varint_roundtrip(0x4000000000); // 7 byte min
+        test_varint_roundtrip(0x1ffffffffff); // 7 byte max
+        test_varint_roundtrip(0x20000000000); // 8 byte min
+        test_varint_roundtrip(0xffffffffffff); // 8 byte max
+        test_varint_roundtrip(0x100000000000); // 9 byte min
+
+        // Test maximum u64 value (requires 9 bytes)
+        test_varint_roundtrip(u64::MAX);
+
+        // Test some random large values
+        test_varint_roundtrip(0x123456789abcdef0);
+        test_varint_roundtrip(0xfedcba9876543210);
+    }
+
+    fn test_varint_roundtrip(value: u64) {
+        let mut buf = [0u8; 10];
+        let encoded_len = Varint::into_bytes(value, &mut buf);
+
+        // Verify encoded length is reasonable (1-9 bytes)
+        assert!(
+            (1..=9).contains(&encoded_len),
+            "Invalid encoded length {} for value {}",
+            encoded_len,
+            value
+        );
+
+        // Decode and verify
+        let decoded = Varint::read_from_slice(&buf[0..encoded_len])
+            .expect(&format!("Failed to decode value {}", value));
+
+        assert_eq!(decoded.value, value, "Roundtrip failed for value {}", value);
+        assert_eq!(
+            decoded.len, encoded_len,
+            "Length mismatch for value {}: encoded={}, decoded={}",
+            value, encoded_len, decoded.len
+        );
+    }
+
+    #[test]
+    fn varint_error_cases() {
+        // Test empty buffer
+        assert!(Varint::read_from_slice(&[]).is_none());
+
+        // Test incomplete varint (continuation bit set but no next byte)
+        assert!(Varint::read_from_slice(&[0x80]).is_none());
+        assert!(Varint::read_from_slice(&[0xff, 0x80]).is_none());
+
+        // Test buffer too short for indicated length
+        assert!(
+            Varint::read_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]).is_none()
+        );
+    }
+
+    #[test]
+    fn varint_encoding_specifics() {
+        // Test specific encoding patterns
+        let mut buf = [0u8; 10];
+
+        // Value 0 should encode as single byte 0x00
+        let len = Varint::into_bytes(0, &mut buf);
+        assert_eq!(len, 1);
+        assert_eq!(buf[0], 0x00);
+
+        // Value 127 should encode as single byte 0x7f
+        let len = Varint::into_bytes(127, &mut buf);
+        assert_eq!(len, 1);
+        assert_eq!(buf[0], 0x7f);
+
+        // Value 128 should encode as two bytes: 0x80, 0x01
+        let len = Varint::into_bytes(128, &mut buf);
+        assert_eq!(len, 2);
+        assert_eq!(buf[0], 0x80);
+        assert_eq!(buf[1], 0x01);
+
+        // Value 16383 (0x3fff) should encode as two bytes: 0xff, 0x7f
+        let len = Varint::into_bytes(16383, &mut buf);
+        assert_eq!(len, 2);
+        assert_eq!(buf[0], 0xff);
+        assert_eq!(buf[1], 0x7f);
+    }
+
+    #[test]
+    fn varint_debug_test() {
+        // Debug test to understand the encoding issue
+        let mut buf = [0u8; 10];
+
+        // Test value 128
+        let len = Varint::into_bytes(128, &mut buf);
+        println!("Value 128 encoded as {} bytes: {:?}", len, &buf[0..len]);
+
+        let decoded = Varint::read_from_slice(&buf[0..len]).unwrap();
+        println!("Decoded value: {}, length: {}", decoded.value, decoded.len);
+
+        // Test what 0x81, 0x00 decodes to
+        let test_bytes = [0x81, 0x00];
+        let decoded2 = Varint::read_from_slice(&test_bytes).unwrap();
+        println!(
+            "Bytes [0x81, 0x00] decode to: {}, length: {}",
+            decoded2.value, decoded2.len
+        );
+
+        // Test what 0x80, 0x01 decodes to
+        let test_bytes2 = [0x80, 0x01];
+        let decoded3 = Varint::read_from_slice(&test_bytes2).unwrap();
+        println!(
+            "Bytes [0x80, 0x01] decode to: {}, length: {}",
+            decoded3.value, decoded3.len
+        );
+    }
+
+    #[test]
+    fn varint_decode_specifics() {
+        // Test specific decoding patterns
+
+        // Single byte 0x00 should decode to 0
+        let varint = Varint::read_from_slice(&[0x00]).unwrap();
+        assert_eq!(varint.value, 0);
+        assert_eq!(varint.len, 1);
+
+        // Single byte 0x7f should decode to 127
+        let varint = Varint::read_from_slice(&[0x7f]).unwrap();
+        assert_eq!(varint.value, 127);
+        assert_eq!(varint.len, 1);
+
+        // Two bytes 0x80, 0x01 should decode to 128
+        let varint = Varint::read_from_slice(&[0x80, 0x01]).unwrap();
+        assert_eq!(varint.value, 128);
+        assert_eq!(varint.len, 2);
+
+        // Two bytes 0xff, 0x7f should decode to 16383
+        let varint = Varint::read_from_slice(&[0xff, 0x7f]).unwrap();
+        assert_eq!(varint.value, 16383);
+        assert_eq!(varint.len, 2);
     }
 }
