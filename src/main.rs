@@ -617,8 +617,13 @@ impl<'a> IndexInteriorCell<'a> {
 /// 49 bits - BBBBBBA
 /// 56 bits - BBBBBBBA
 /// 64 bits - BBBBBBBBC
+///
+/// NOTE: This varint is different from sqlite varint: we use little engine
+/// layout for storing varint.
 struct Varint {
+    // the value this varint represents
     value: u64,
+    // the number of bytes for storing this varint in disk
     len: usize,
 }
 
@@ -644,13 +649,13 @@ impl Varint {
 
             if n >= 8 {
                 // 9th byte: store full 8 bits (no continuation bit)
-                value |= ((buf[n] as u64) << (n * 7));
+                value |= (buf[n] as u64) << (n * 7);
                 n += 1;
                 break;
             }
 
             let bits = buf[n] & 0x7f;
-            value |= ((bits as u64) << (n * 7));
+            value |= (bits as u64) << (n * 7);
 
             if buf[n] & 0x80 == 0 {
                 n += 1;
@@ -684,7 +689,7 @@ impl Varint {
 
         let msb = value & ((0xff000000_u64) << 32);
         if msb > 0 {
-            buf[8] = msb as u8;
+            buf[8] = ((msb >> 32) >> 24) as u8;
             let mut value = value;
             for byte in buf[0..8].as_mut() {
                 *byte = ((value & 0x7f) | 0x80) as u8;
@@ -707,7 +712,7 @@ impl Varint {
             n += 1;
         }
         // reset the most significant bit of the last byte
-        buf[n] &= 0x7f;
+        buf[n - 1] &= 0x7f;
 
         n
     }
@@ -957,7 +962,6 @@ mod tests {
         test_varint_roundtrip(0x7f); // 1 byte max
         test_varint_roundtrip(0x80); // 2 byte min
         test_varint_roundtrip(0x3fff); // 2 byte max
-        // FIX:
         test_varint_roundtrip(0x4000); // 3 byte min
         test_varint_roundtrip(0x1fffff); // 3 byte max
         test_varint_roundtrip(0x200000); // 4 byte min
