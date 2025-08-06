@@ -464,7 +464,7 @@ impl Page {
     fn get_cell(&self, n: u16) -> Cell<'_> {
         let cell = &self.data[dbg!(self.cell_offset(n))..];
         match self.page_type() {
-            PageType::TableLeaf => Cell::TableLeaf(TableLeafCell::deserialize(cell)),
+            PageType::TableLeaf => Cell::TableLeaf(TableLeafCell::deserialize(dbg!(cell))),
             PageType::TableInterior => Cell::TableInterior(TableInteriorCell::parse(cell)),
             PageType::IndexLeaf => Cell::IndexLeaf(IndexLeafCell::parse(cell)),
             PageType::IndexInterior => Cell::IndexInterior(IndexInteriorCell::parse(cell)),
@@ -491,13 +491,13 @@ impl<'a> TableLeafCell<'a> {
             value: payload_len,
             len: offset1,
         } = Varint::read_from_slice(data).unwrap();
+        dbg!(payload_len);
 
         // second varint: rowid
         let Varint {
             value: rowid,
             len: offset2,
         } = Varint::read_from_slice(&data[offset1..]).unwrap();
-        println!("payload_len {payload_len}");
 
         // deserialize payload and the page number of the first overflow page
         let payload = if payload_len as usize > PAGE_SIZE - offset1 - offset2 {
@@ -518,11 +518,13 @@ impl<'a> TableLeafCell<'a> {
     }
 
     fn serialize(row: &Row, cell_content: &mut [u8]) {
-        // 1. write the first varint
+        // 1. write the first varint: number of bytes of payload
         let mut off = Varint::into_bytes(row.len as u64, cell_content);
+        println!("payload len={}", row.len);
 
-        // 2. write the second varint
-        off += Varint::into_bytes(0, cell_content);
+        // 2. write the second varint: rowid
+        off += Varint::into_bytes(0, &mut cell_content[off..]);
+        dbg!(&cell_content[0..off]);
 
         // 3. write payload
         // Assume no large data written into a row
@@ -533,6 +535,10 @@ impl<'a> TableLeafCell<'a> {
 
     fn get_row(&self) -> Row {
         Row::deserialize(self.payload).unwrap()
+    }
+
+    fn len(payload_len: usize, rowid: u64) -> usize {
+        Varint::eval_len(payload_len as u64) + Varint::eval_len(rowid) + payload_len
     }
 }
 
@@ -716,6 +722,27 @@ impl Varint {
 
         n
     }
+
+
+    fn eval_len(value: u64) -> usize {
+        if value <= 0x7f {
+            return 1;
+        }
+        if value <= 0x3fff {
+            return 2;
+        }
+        if (value & ((0xff000000_u64) << 32)) > 0 {
+            return 9;
+        }
+
+        let mut bytes = value;
+        let mut n = 0;
+        while bytes != 0 {
+            bytes >>= 7;
+            n += 1;
+        }
+        n
+    }
 }
 
 impl Page {
@@ -755,12 +782,12 @@ impl Page {
             let cell_num = self.num_cells() + 1;
             self.set_num_cells(cell_num);
             let end = self.cell_start() as usize;
-            let start = end - row.len;
+            let start = end - TableLeafCell::len(row.len, 0);
             self.set_cell_offset(cell_num, start as u16);
-            self.set_cell_start(start as u16);
+            self.set_cell_start(dbg!(start) as u16);
 
-            TableLeafCell::serialize(row, &mut self.data[start..start + row.len]);
-            println!("row written to offset: {start}");
+            TableLeafCell::serialize(row, &mut self.data[start..]);
+            dbg!(&self.data[start..]);
         }
         self.set_dirty();
         true
