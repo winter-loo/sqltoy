@@ -86,6 +86,7 @@ fn sqlite3_step(stmt: Sqlite3Stmt, table: &mut Table) {
         }
         Statement::Insert(insert_stmt) => {
             table.insert(insert_stmt.row);
+            println!("insert OK");
         }
         Statement::Commit => {
             // persist table data into file
@@ -436,35 +437,29 @@ impl Page {
         }
     }
 
+    /// get the n-th cell pointer offset value
+    /// n starts from 0
     fn cell_offset(&self, n: u16) -> usize {
         let cell_pointer_start = self.cell_pointer_offset();
-        let cell_pointer_offset = cell_pointer_start
-            + if n == 0 {
-                0
-            } else {
-                (n - 1) as usize * Page::CELL_POINTER_SIZE
-            };
+        let cell_pointer_offset = cell_pointer_start + n as usize * Page::CELL_POINTER_SIZE;
         u16::from_be_bytes([
             self.data[cell_pointer_offset],
             self.data[cell_pointer_offset + 1],
         ]) as usize
     }
 
+    /// set the n-th cell pointer offset value
+    /// n starts from 0
     fn set_cell_offset(&mut self, n: u16, offset: u16) {
         let cell_pointer_start = self.cell_pointer_offset();
-        let off = cell_pointer_start
-            + if n == 0 {
-                0
-            } else {
-                (n - 1) as usize * Page::CELL_POINTER_SIZE
-            };
+        let off = cell_pointer_start + n as usize * Page::CELL_POINTER_SIZE;
         self.data[off..off + Page::CELL_POINTER_SIZE].copy_from_slice(&offset.to_be_bytes());
     }
 
     fn get_cell(&self, n: u16) -> Cell<'_> {
-        let cell = &self.data[dbg!(self.cell_offset(n))..];
+        let cell = &self.data[self.cell_offset(n)..];
         match self.page_type() {
-            PageType::TableLeaf => Cell::TableLeaf(TableLeafCell::deserialize(dbg!(cell))),
+            PageType::TableLeaf => Cell::TableLeaf(TableLeafCell::deserialize(cell)),
             PageType::TableInterior => Cell::TableInterior(TableInteriorCell::parse(cell)),
             PageType::IndexLeaf => Cell::IndexLeaf(IndexLeafCell::parse(cell)),
             PageType::IndexInterior => Cell::IndexInterior(IndexInteriorCell::parse(cell)),
@@ -491,7 +486,6 @@ impl<'a> TableLeafCell<'a> {
             value: payload_len,
             len: offset1,
         } = Varint::read_from_slice(data).unwrap();
-        dbg!(payload_len);
 
         // second varint: rowid
         let Varint {
@@ -520,11 +514,9 @@ impl<'a> TableLeafCell<'a> {
     fn serialize(row: &Row, cell_content: &mut [u8]) {
         // 1. write the first varint: number of bytes of payload
         let mut off = Varint::into_bytes(row.len as u64, cell_content);
-        println!("payload len={}", row.len);
 
         // 2. write the second varint: rowid
         off += Varint::into_bytes(0, &mut cell_content[off..]);
-        dbg!(&cell_content[0..off]);
 
         // 3. write payload
         // Assume no large data written into a row
@@ -723,7 +715,6 @@ impl Varint {
         n
     }
 
-
     fn eval_len(value: u64) -> usize {
         if value <= 0x7f {
             return 1;
@@ -783,11 +774,10 @@ impl Page {
             self.set_num_cells(cell_num);
             let end = self.cell_start() as usize;
             let start = end - TableLeafCell::len(row.len, 0);
-            self.set_cell_offset(cell_num, start as u16);
-            self.set_cell_start(dbg!(start) as u16);
+            self.set_cell_offset(cell_num - 1, start as u16);
+            self.set_cell_start(start as u16);
 
             TableLeafCell::serialize(row, &mut self.data[start..]);
-            dbg!(&self.data[start..]);
         }
         self.set_dirty();
         true
@@ -814,6 +804,7 @@ impl<'a> Iterator for PageIterator<'a> {
             return None;
         }
         let cell = self.page.get_cell(self.rownum);
+        self.rownum += 1;
         match cell {
             Cell::TableLeaf(cell) => Some(cell.get_row()),
             _ => todo!("decode other kinds of cells"),
